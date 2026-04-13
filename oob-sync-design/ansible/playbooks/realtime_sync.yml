@@ -1,0 +1,31 @@
+# ============================================================
+# realtime_sync.yml — seed Agent에서 실행하는 fan-out 전용
+#
+# 새 네트워크 전제:
+#   - Nexus 다운로드는 Master가 수행 (이 playbook에서 하지 않음)
+#   - Master → seed 전송 완료 후 이 playbook 호출
+#   - 이 playbook은 seed → same-region peer fan-out만 수행
+#
+# 삭제 이벤트는 별도 quarantine_delete.yml로 처리
+# ============================================================
+- name: seed에서 peer fan-out 실행
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  vars_files:
+    - ../group_vars/all.yml
+  tasks:
+    - name: 실행 컨텍스트 표시
+      debug:
+        msg: >-
+          [fan-out 실행] event_id={{ event_id }} location={{ location_code }}
+          seed={{ selected_seed_node }} peers={{ selected_peer_nodes }}
+
+    - name: fan-out 대상 확인
+      when: selected_peer_nodes | length == 0
+      debug:
+        msg: "[peer 없음 — fan-out 건너뜀]"
+
+    - name: same-region peer fan-out 실행
+      when: selected_peer_nodes | length > 0
+      include_tasks: fanout_to_oob_peers.yml

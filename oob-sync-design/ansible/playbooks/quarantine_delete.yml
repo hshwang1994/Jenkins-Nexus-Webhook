@@ -1,0 +1,52 @@
+# ============================================================
+# quarantine_delete.yml
+# 삭제 이벤트 처리.
+# 최종 경로의 파일을 즉시 삭제하지 않고, quarantine 경로로 이동만 한다.
+# 실제 최종 삭제는 주기 점검이 Nexus 기준으로 다시 확인한 후 수행한다.
+# 대표/대상 OOB 에이전트 모두에서 동일 규칙으로 이동한다.
+# ============================================================
+- name: quarantine 디렉터리 준비
+  file:
+    path: "{{ quarantine_absolute_path | dirname }}"
+    state: directory
+    mode: '0750'
+
+- name: 최종 경로 존재 여부 확인
+  stat:
+    path: "{{ final_absolute_path }}"
+  register: _final_stat
+
+- name: 삭제 대상이 이미 없는 경우 경고 로그
+  when: not _final_stat.stat.exists
+  debug:
+    msg: |
+      [삭제 대상 파일 없음]
+      발생상황: Nexus 에서 삭제 이벤트가 전달되었지만 대표 OOB 에이전트에 해당 파일이 이미 없습니다.
+      원인: 이미 이전 삭제 이벤트로 처리되었거나, 처음부터 동기화되지 않은 파일일 수 있습니다.
+      문제: 추가 조치 없음.
+      조치방법: 주기 점검이 전체 정합성을 확인하므로 별도 조치는 필요하지 않습니다.
+
+- name: 대표 OOB 에이전트 파일을 quarantine 으로 이동
+  when: _final_stat.stat.exists
+  command: >-
+    mv -f "{{ final_absolute_path }}" "{{ quarantine_absolute_path }}"
+
+- name: 대상 OOB 에이전트에서도 동일하게 quarantine 이동
+  when: selected_peer_nodes | length > 0
+  loop: "{{ selected_peer_nodes }}"
+  loop_control: { loop_var: peer }
+  command: >-
+    ssh -i "{{ lookup('env','OOB_SSH_KEY') }}" -o StrictHostKeyChecking=no
+        {{ sync_cfg.fanout.ssh_user }}@{{ peer }}
+        "mkdir -p '{{ quarantine_absolute_path | dirname }}' &&
+         if [ -f '{{ final_absolute_path }}' ]; then
+           mv -f '{{ final_absolute_path }}' '{{ quarantine_absolute_path }}';
+         fi"
+  ignore_errors: true
+
+- name: quarantine 완료 로그
+  debug:
+    msg: >-
+      [quarantine 완료] repository={{ repository_name }} asset_path={{ asset_path }}
+      quarantine={{ quarantine_absolute_path }}
+      (최종 삭제는 주기 점검이 Nexus 기준으로 재확인한 후 수행)

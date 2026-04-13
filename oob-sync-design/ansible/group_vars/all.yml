@@ -1,0 +1,34 @@
+# ============================================================
+# 공통 그룹 변수
+# config/sync_config.yml 의 값을 include_vars 로 끌어오는 것이 아니라,
+# Jenkins 파이프라인이 환경 변수로 주입하거나 이 파일을 통해
+# 참조할 수 있도록 동일 키 이름으로 미러링한다.
+# ============================================================
+sync_config_path: "{{ lookup('env','SYNC_CONFIG_PATH') | default('/etc/oob-sync/sync_config.yml', true) }}"
+
+# playbook 첫 단계에서 로드한 sync_config 를 이 이름으로 사용한다.
+sync_cfg: "{{ lookup('file', sync_config_path) | from_yaml }}"
+
+# event payload (Jenkins 가 INVENTORY_JSON 으로 주입)
+event_payload: "{{ lookup('env','INVENTORY_JSON') | from_json }}"
+
+# 편의 변수
+event_id:             "{{ event_payload.event_id }}"
+location_code:        "{{ event_payload.location_code }}"
+repository_name:      "{{ event_payload.repository_name }}"
+asset_path:           "{{ event_payload.asset_path }}"
+download_url:         "{{ event_payload.download_url }}"
+checksum_algorithm:   "{{ event_payload.checksum_algorithm | default('sha256') }}"
+checksum_value:       "{{ event_payload.checksum_value | default('') }}"
+file_size_bytes:      "{{ event_payload.file_size_bytes | default(0) | int }}"
+operation_type:       "{{ event_payload.operation_type }}"
+selected_seed_node:   "{{ event_payload.selected_seed_node }}"
+selected_peer_nodes:  "{{ event_payload.selected_peer_nodes | default([]) }}"
+selection_reason:     "{{ event_payload.selection_reason | default('') }}"
+
+# 경로 계산
+final_relative_path:     "{{ repository_name }}/{{ asset_path }}"
+final_absolute_path:     "{{ sync_cfg.sync_root_path }}/{{ final_relative_path }}"
+temp_absolute_path:      "{{ sync_cfg.temp_root_path }}/{{ final_relative_path }}.part"
+incoming_absolute_path:  "{{ sync_cfg.incoming_root_path }}/{{ final_relative_path }}.part"
+quarantine_absolute_path:"{{ sync_cfg.quarantine_root_path }}/{{ final_relative_path }}"

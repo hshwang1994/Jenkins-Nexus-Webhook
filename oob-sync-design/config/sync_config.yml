@@ -1,0 +1,126 @@
+# ============================================================
+# OOB 파일 동기화 공통 설정
+# 이 파일은 Jenkinsfile / Ansible playbook 양쪽에서 읽는
+# 단일 진실 원천(Single Source of Truth) 이다.
+# 모든 식별 값과 운영 값은 여기서만 관리한다.
+# ============================================================
+
+# 지역 코드 목록 (Jenkins Agent 라벨과 동일)
+location_codes:
+  - ich   # 이천
+  - chj   # 청주
+  - yi    # 용인
+
+# OOB Agent 선별 라벨
+oob_selector_label: redfish
+
+# 특정 노드를 영구 제외하고 싶을 때만 사용 (보통 비워둠)
+exclude_node_names: []
+
+# ============================================================
+# 네트워크 전제 (변경 금지)
+# ============================================================
+# 1. Nexus ↔ Jenkins Master: 모든 포트 오픈
+# 2. Jenkins Master ↔ 각 Agent: SSH 22 오픈
+# 3. Agent ↔ Agent 같은 지역: 모든 포트 오픈
+# 4. Agent ↔ Agent 다른 지역: 통신 불가
+# ============================================================
+# 핵심 규칙:
+#   - OOB Agent가 Nexus에 직접 접근하지 않음
+#   - Jenkins Master가 Nexus에서 파일 다운로드 → seed에 SSH 전송
+#   - fan-out은 같은 지역 peer끼리만 허용
+# ============================================================
+
+# 최종 경로 / 임시 경로 규칙
+sync_root_path:       /sync/files
+temp_root_path:       /sync/tmp          # Master 다운로드 임시 경로 (Master 로컬)
+incoming_root_path:   /sync/incoming     # OOB Agent 수신 임시 경로
+quarantine_root_path: /sync/quarantine   # 삭제 격리 경로
+master_staging_path:  /var/lib/oob-sync/staging  # Master에서 Nexus 다운로드 후 임시 저장
+
+# 스케줄 (Jenkins cron 표기)
+reconcile_schedule:
+  partial: "H/30 * * * *"    # 부분 점검: 30분마다
+  full:    "H 3 * * *"       # 전체 점검: 하루 1회 (03시 부근)
+heartbeat_schedule: "H/15 * * * *"  # 에이전트 상태 점검: 15분마다
+
+# ============================================================
+# Nexus 접속 정보
+# ============================================================
+# Source of Truth: 178 infra-automation-raw-hosted
+# Jenkins는 오케스트레이터 및 중간 전달 허브. 대체 파일 소스가 아님.
+nexus:
+  base_url: http://10.100.64.178:8081
+  credentials_id: nexus-oob-sync-readonly
+  webhook_secret_credentials_id: nexus-webhook-hmac-secret
+  api_timeout_seconds: 60
+  # 동기화 대상 repository 허용 목록
+  # infra-automation-raw-hosted 만 동기화 대상
+  allowed_repositories:
+    - infra-automation-raw-hosted
+
+# 재시도 / 백오프
+retry:
+  download_max_attempts: 3
+  download_backoff_seconds: 30
+  fanout_max_attempts: 3
+  fanout_backoff_seconds: 15
+
+# 무결성 검증
+checksum:
+  preferred_algorithm: sha256
+  fallback_algorithm: sha1
+
+# 빌드 보관 정책
+build_retention:
+  realtime:  { num_to_keep: 50, days_to_keep: 14 }
+  partial:   { num_to_keep: 30, days_to_keep: 14 }
+  full:      { num_to_keep: 14, days_to_keep: 30 }
+  heartbeat: { num_to_keep: 30, days_to_keep: 7 }
+
+# 대용량 파일 전송 한도
+limits:
+  max_file_size_bytes: 21474836480   # 20 GB
+  min_free_disk_bytes:  53687091200  # 50 GB 여유 확보 기준
+
+# Ansible playbook 배포 경로
+ansible_playbook_dir: /opt/oob-sync/ansible/playbooks
+
+# fan-out 전송 수단 (같은 지역 peer 간 rsync over ssh)
+fanout:
+  transport: rsync
+  rsync_options: "-avz --partial --inplace --whole-file --timeout=300"
+  ssh_user: cloviradmin
+  ssh_key_credentials_id: oob-sync-ssh-key
+  # 운영 전: StrictHostKeyChecking=no → known_hosts 사전 등록 후 제거
+  # 06_운영하드닝.md 참조
+  ssh_options: "-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+# Master → Seed 전송 수단 (Jenkins Master → regional seed)
+master_to_seed:
+  transport: scp
+  ssh_user: cloviradmin
+  ssh_key_credentials_id: master-to-agent-ssh
+  ssh_options: "-o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
+# ============================================================
+# Agent 이름 → IP 매핑 (JNLP/WebSocket Agent 환경 필수)
+# ============================================================
+# Jenkins Agent가 JNLP/WebSocket 방식으로 연결되어 있으면
+# SSHLauncher.getHost()가 비어 있으므로 여기서 명시 매핑한다.
+# 새 Agent 추가 시 이 목록도 반드시 갱신할 것.
+agent_ip_map:
+  # 운영 Master (198) 하위
+  nexus-jenkins-ops-agent:    "10.100.64.186"   # ich
+  nexus-jenkins-ops-agent02:  "10.100.64.189"   # ich
+  nexus-jenkins-ops-agent03:  "10.100.64.172"   # chj
+  nexus-jenkins-ops-agent04:  "10.100.64.173"   # chj
+  nexus-jenkins-ops-agent05:  "10.100.64.174"   # yi
+  nexus-jenkins-ops-agent06:  "10.100.64.177"   # yi
+  # 개발 Master (199) 하위
+  nexus-jenkins-dev-agent:    "10.100.64.187"   # ich
+  nexus-jenkins-dev-agent02:  "10.100.64.188"   # ich
+  nexus-jenkins-dev-agent03:  "10.100.64.190"   # chj
+  nexus-jenkins-dev-agent04:  "10.100.64.192"   # chj
+  nexus-jenkins-dev-agent05:  "10.100.64.193"   # yi
+  nexus-jenkins-dev-agent06:  "10.100.64.194"   # yi

@@ -1,0 +1,19 @@
+# 다운로드 전 디스크 여유 확인
+- name: 다운로드 전 여유 디스크 측정
+  shell: "df -B1 --output=avail '{{ sync_cfg.temp_root_path }}' | tail -n1"
+  register: _df_pre
+  changed_when: false
+
+- name: 디스크 부족 시 실패
+  when: (_df_pre.stdout | int) < ((file_size_bytes | int) + (sync_cfg.limits.min_free_disk_bytes | int))
+  fail:
+    msg: |
+      [디스크 부족으로 다운로드 중단]
+      발생상황: {{ sync_cfg.temp_root_path }} 의 여유 디스크가 파일 수신에 부족합니다.
+      필요={{ ((file_size_bytes | int) + (sync_cfg.limits.min_free_disk_bytes | int)) // (1024*1024*1024) }} GB
+      현재={{ (_df_pre.stdout | int) // (1024*1024*1024) }} GB
+      원인: 임시 경로 또는 quarantine 경로에 오래된 파일이 누적되어 있을 수 있습니다.
+      문제: 손상된 임시 파일이 생길 수 있어 사전 차단합니다.
+      조치방법:
+        1. quarantine/tmp 경로의 오래된 파일을 정리합니다.
+        2. 공간 확보 후 동일 이벤트를 재실행합니다.

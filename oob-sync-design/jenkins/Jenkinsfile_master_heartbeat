@@ -1,0 +1,102 @@
+// ============================================================
+// master_heartbeat
+//
+// 15분마다 모든 OOB Agent 상태를 점검하고
+// 이상 감지 시 한글 5단 로그를 출력한다.
+// ============================================================
+
+import jenkins.model.Jenkins
+
+properties([
+  buildDiscarder(logRotator(numToKeepStr: '30', daysToKeepStr: '7')),
+  pipelineTriggers([ cron('H/15 * * * *') ])
+])
+
+def sync_cfg = null
+
+pipeline {
+  agent { label 'built-in' }
+  environment {
+    SYNC_CONFIG_PATH       = '/etc/oob-sync/sync_config.yml'
+    ANSIBLE_PLAYBOOK_DIR   = '/opt/oob-sync/ansible/playbooks'
+  }
+  stages {
+    stage('1. 공통 설정 로드') {
+      steps { script { sync_cfg = readYaml(file: env.SYNC_CONFIG_PATH) } }
+    }
+    stage('2. 리전별 상태 점검') {
+      steps {
+        script {
+          for (loc in sync_cfg.location_codes) {
+            heartbeatOneRegion(loc, sync_cfg)
+          }
+        }
+      }
+    }
+  }
+}
+
+def heartbeatOneRegion(String location_code, def sync_cfg) {
+  def selector = "${location_code} && ${sync_cfg.oob_selector_label}"
+  def candidate = nodesByLabel(label: selector, offline: true)
+  def online  = []
+  def offline = []
+  candidate.each { name ->
+    if (sync_cfg.exclude_node_names?.contains(name)) return
+    def c = Jenkins.get().getNode(name)?.toComputer()
+    if (c?.isOnline()) online << name else offline << name
+  }
+
+  echo "[${location_code} 상태 점검 요약] online=${online} offline=${offline}"
+
+  if (offline) {
+    echo """[${location_code} OOB 에이전트 일부 오프라인]
+
+발생상황:
+${location_code} 리전의 OOB 에이전트 중 일부가 오프라인 상태입니다.
+오프라인 노드: ${offline}
+
+원인:
+에이전트 프로세스 중지, 네트워크 단절, SSH 불가 등이 원인일 수 있습니다.
+
+문제:
+오프라인 노드는 실시간 동기화 대상에서 자동 제외됩니다.
+해당 노드가 복구되면, 다음 주기 점검에서 reconcile 이 Nexus 기대 상태 기준으로
+누락된 파일을 식별하고 대표 OOB 에이전트가 해당 파일을 전파하여 따라잡습니다.
+
+조치방법:
+1. Jenkins 노드 관리 화면에서 오프라인 노드(${offline}) 상태를 확인합니다.
+2. 에이전트 재시작 또는 네트워크 복구 후 정상화됩니다."""
+  }
+
+  // 각 online 노드에서 디스크/경로 상태 점검
+  online.each { nodeName ->
+    node(nodeName) {
+      withEnv(["SYNC_CONFIG_PATH=${env.SYNC_CONFIG_PATH}"]) {
+        def rc = sh(returnStatus: true, script: """
+          ansible-playbook \
+            "\${ANSIBLE_PLAYBOOK_DIR}/heartbeat_check.yml" \
+            -e "target_host=localhost" \
+            -v
+        """)
+        if (rc != 0) {
+          echo """[${nodeName} 상태 점검 실패]
+
+발생상황:
+${nodeName} 에서 heartbeat 점검이 실패했습니다.
+
+원인:
+디스크 여유 부족, 동기화 경로(/sync) 미존재, 파일 시스템 권한 문제 등.
+
+문제:
+이 노드가 다음 실시간 동기화에서 실패할 가능성이 높습니다.
+
+조치방법:
+1. /sync 경로가 존재하고 fan-out 사용자(sync_config.yml 의 fanout.ssh_user)에 읽기/쓰기 권한이 있는지 확인합니다.
+2. df -h 로 여유 디스크를 점검합니다.
+3. quarantine/tmp 경로의 오래된 파일을 정리합니다."""
+        }
+      }
+    }
+  }
+}

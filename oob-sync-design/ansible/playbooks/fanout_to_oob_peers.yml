@@ -1,0 +1,83 @@
+# ============================================================
+# fanout_to_oob_peers.yml — 대표 → 대상 OOB 에이전트 rsync 전파
+#
+# 실시간 동기화에서 단일 파일 전파 시 호출.
+# 절차: incoming 수신 → checksum 검증 → 최종 경로 원자적 이동
+# ============================================================
+- name: fan-out 시작 로그
+  debug:
+    msg: "[fan-out 시작] seed={{ selected_seed_node }} peers={{ selected_peer_nodes }}"
+
+- name: 대상 OOB 에이전트 incoming 디렉터리 준비 (ssh)
+  loop: "{{ selected_peer_nodes }}"
+  loop_control: { loop_var: peer }
+  delegate_to: localhost
+  command: >-
+    ssh -i "{{ lookup('env','OOB_SSH_KEY') }}"
+        -o StrictHostKeyChecking=no
+        {{ sync_cfg.fanout.ssh_user }}@{{ peer }}
+        "mkdir -p '{{ incoming_absolute_path | dirname }}' &&
+         mkdir -p '{{ final_absolute_path | dirname }}' &&
+         rm -f '{{ incoming_absolute_path }}'"
+  register: _prep
+  failed_when: _prep.rc != 0
+
+- name: 대표 → 대상 rsync 전송 (재시도 {{ sync_cfg.retry.fanout_max_attempts }}회)
+  loop: "{{ selected_peer_nodes }}"
+  loop_control: { loop_var: peer }
+  delegate_to: localhost
+  command: >-
+    rsync {{ sync_cfg.fanout.rsync_options }}
+          -e "ssh -i {{ lookup('env','OOB_SSH_KEY') }} -o StrictHostKeyChecking=no"
+          "{{ final_absolute_path }}"
+          "{{ sync_cfg.fanout.ssh_user }}@{{ peer }}:{{ incoming_absolute_path }}"
+  register: _rsync_results
+  retries: "{{ sync_cfg.retry.fanout_max_attempts }}"
+  delay: "{{ sync_cfg.retry.fanout_backoff_seconds }}"
+  until: _rsync_results is succeeded
+  ignore_errors: true
+
+- name: 성공 노드 추출
+  set_fact:
+    _fanout_ok_peers:   "{{ _rsync_results.results | selectattr('rc','equalto',0) | map(attribute='peer') | list }}"
+    _fanout_fail_peers: "{{ _rsync_results.results | rejectattr('rc','equalto',0) | map(attribute='peer') | list }}"
+
+- name: 성공 노드에서 checksum 검증 + 최종 경로 원자적 이동
+  loop: "{{ _fanout_ok_peers }}"
+  loop_control: { loop_var: peer }
+  delegate_to: localhost
+  shell: |
+    ssh -i "{{ lookup('env','OOB_SSH_KEY') }}" -o StrictHostKeyChecking=no \
+        {{ sync_cfg.fanout.ssh_user }}@{{ peer }} \
+        "ACTUAL=\$({{ checksum_algorithm }}sum '{{ incoming_absolute_path }}' | awk '{print \$1}'); \
+         if [ -n '{{ checksum_value }}' ] && [ \"\$ACTUAL\" != '{{ checksum_value }}' ]; then \
+           rm -f '{{ incoming_absolute_path }}'; \
+           echo 'CHECKSUM_MISMATCH'; exit 42; \
+         fi; \
+         mv -f '{{ incoming_absolute_path }}' '{{ final_absolute_path }}'"
+  register: _finalize_results
+  ignore_errors: true
+
+- name: 검증/이동 실패 노드 재집계
+  set_fact:
+    _finalize_fail_peers: "{{ _finalize_results.results | rejectattr('rc','equalto',0) | map(attribute='peer') | list }}"
+
+- name: fan-out 요약
+  debug:
+    msg: >-
+      [fan-out 요약] 성공={{ _fanout_ok_peers | difference(_finalize_fail_peers) }}
+      전송실패={{ _fanout_fail_peers }} 검증실패={{ _finalize_fail_peers }}
+
+- name: fan-out 일부 실패 한글 로그
+  when: (_fanout_fail_peers | length) > 0 or (_finalize_fail_peers | length) > 0
+  debug:
+    msg: |
+      [대상 OOB 에이전트 일부 전파 실패]
+      발생상황: 일부 대상 OOB 에이전트에서 전파 또는 검증이 실패했습니다.
+      전송실패: {{ _fanout_fail_peers }}
+      검증실패: {{ _finalize_fail_peers }}
+      원인: 네트워크 불안정, 디스크 부족, SSH 키 문제, 전송 중 오염 중 하나.
+      문제: 해당 노드들은 최신 파일을 반영하지 못했으며, 기존 파일이 있으면 기존 상태를 유지합니다.
+      조치방법:
+        1. 해당 노드의 디스크/네트워크/SSH 상태를 점검합니다.
+        2. 다음 주기 점검이 실패 노드만 자동으로 재전송합니다.

@@ -1,0 +1,49 @@
+# ============================================================
+# download_from_nexus.yml — Nexus 에서 임시 경로로 다운로드
+#
+# 인증: NEXUS_USER/NEXUS_PASS 환경변수 (Jenkins withCredentials)
+# 재시도: sync_config.yml 의 retry 설정 적용
+# ============================================================
+- name: 임시 디렉터리 생성
+  file:
+    path: "{{ temp_absolute_path | dirname }}"
+    state: directory
+    mode: '0755'
+
+- name: 기존 임시 파일 제거 (불완전 파일 방지)
+  file:
+    path: "{{ temp_absolute_path }}"
+    state: absent
+
+- name: Nexus 에서 파일 다운로드 (재시도 {{ sync_cfg.retry.download_max_attempts }}회)
+  get_url:
+    url: "{{ download_url }}"
+    dest: "{{ temp_absolute_path }}"
+    url_username: "{{ lookup('env','NEXUS_USER') }}"
+    url_password: "{{ lookup('env','NEXUS_PASS') }}"
+    force_basic_auth: true
+    timeout: "{{ sync_cfg.nexus.api_timeout_seconds }}"
+    mode: '0644'
+  register: _download_result
+  retries: "{{ sync_cfg.retry.download_max_attempts }}"
+  delay: "{{ sync_cfg.retry.download_backoff_seconds }}"
+  until: _download_result is succeeded
+
+- name: 다운로드 결과 요약 로그
+  debug:
+    msg: >-
+      [대표 OOB 에이전트 다운로드 완료] path={{ temp_absolute_path }}
+      size={{ _download_result.size | default('-') }}
+
+- name: 다운로드 실패 시 한글 로그
+  when: _download_result is failed
+  fail:
+    msg: |
+      [대표 OOB 에이전트 다운로드 실패]
+      발생상황: 대표 OOB 에이전트가 Nexus 에서 파일을 다운로드하지 못했습니다.
+      원인: Nexus 접속 불가, 인증 실패, 네트워크 단절, 디스크 부족 중 하나.
+      문제: 해당 리전 OOB Agent 들이 최신 파일을 받을 수 없습니다.
+      조치방법:
+        1. Jenkins Credentials(nexus-oob-sync-readonly) 의 유효성을 확인합니다.
+        2. 대표 OOB 에이전트에서 curl 로 {{ download_url }} 에 직접 접근해 원인을 식별합니다.
+        3. 해결 후 주기 점검이 자동으로 복구합니다.

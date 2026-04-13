@@ -1,0 +1,34 @@
+# 대용량 바이너리
+*.tar.gz
+*.zip
+*.iso
+*.rpm
+*.jar
+*.war
+
+# Nexus 번들 아카이브
+nexus-install/bundle/
+nexus-install/**/*.tar.gz
+
+# 임시/로그
+*.log
+*.tmp
+*.part
+__pycache__/
+*.pyc
+
+# 테스트 임시 스크립트
+nexus-install/scripts/_*
+oob-sync-design/scripts/_*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Jenkins workspace
+workspace/

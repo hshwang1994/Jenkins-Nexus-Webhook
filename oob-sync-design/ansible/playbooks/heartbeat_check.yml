@@ -1,0 +1,74 @@
+# ============================================================
+# heartbeat_check.yml
+# 각 OOB Agent 의 기본 상태를 점검한다.
+# - /sync 경로 존재 여부
+# - 여유 디스크 확보 여부 (sync_cfg.limits.min_free_disk_bytes)
+# - quarantine 경로 사이즈
+# - 마지막 성공 동기화 시각 (state 파일 기반)
+# ============================================================
+- name: OOB Agent 상태 점검
+  hosts: localhost
+  gather_facts: true
+  connection: local
+  vars_files: [ ../group_vars/all.yml ]
+  vars:
+    state_file_path: "/var/lib/oob-sync/last_sync_state.json"
+  tasks:
+    - name: 필수 디렉터리 존재 확인
+      stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ sync_cfg.sync_root_path }}"
+        - "{{ sync_cfg.temp_root_path }}"
+        - "{{ sync_cfg.incoming_root_path }}"
+        - "{{ sync_cfg.quarantine_root_path }}"
+        - "{{ state_file_path | dirname }}"
+      register: _dir_checks
+
+    - name: 필수 디렉터리 미존재 경고
+      when: _dir_checks.results | selectattr('stat.exists','equalto', false) | list | length > 0
+      debug:
+        msg: |
+          [필수 디렉터리 미존재]
+          발생상황: 아래 디렉터리가 존재하지 않습니다.
+          {{ _dir_checks.results | selectattr('stat.exists','equalto', false) | map(attribute='item') | list }}
+          원인: 초기 구축 시 디렉터리 생성이 누락되었거나, 파일 시스템 장애로 삭제되었습니다.
+          문제: 해당 경로가 없으면 실시간 동기화와 주기 점검이 실패합니다.
+          조치방법:
+            1. fan-out 사용자(sync_config.yml 의 fanout.ssh_user)로 누락된 디렉터리를 생성합니다.
+            2. mkdir -p /sync/{files,tmp,incoming,quarantine} && mkdir -p /var/lib/oob-sync
+            3. chown {{ sync_cfg.fanout.ssh_user }}:{{ sync_cfg.fanout.ssh_user }} 로 권한을 부여합니다.
+
+    - name: 여유 디스크 측정
+      shell: "df -B1 --output=avail '{{ sync_cfg.sync_root_path }}' | tail -n1"
+      register: _df
+      changed_when: false
+
+    - name: 디스크 부족 여부 판단
+      set_fact:
+        free_disk_bytes: "{{ _df.stdout | int }}"
+
+    - name: 디스크 부족 경고
+      when: (free_disk_bytes | int) < (sync_cfg.limits.min_free_disk_bytes | int)
+      debug:
+        msg: |
+          [OOB Agent 디스크 부족]
+          발생상황: {{ inventory_hostname }} 의 여유 디스크가 기준보다 적습니다.
+          현재={{ (free_disk_bytes | int) // (1024*1024*1024) }} GB
+          기준={{ (sync_cfg.limits.min_free_disk_bytes | int) // (1024*1024*1024) }} GB
+          원인: 장기 미청소 quarantine, 대용량 파일 누적.
+          문제: 다음 실시간 동기화가 실패할 가능성이 큽니다.
+          조치방법:
+            1. quarantine 경로의 오래된 파일을 정리합니다.
+            2. 용량 확보 후 자동으로 정상화됩니다.
+
+    - name: 최근 동기화 상태 파일 읽기 (없으면 skip)
+      stat: { path: "{{ state_file_path }}" }
+      register: _state_stat
+
+    - name: 상태 요약 로그
+      debug:
+        msg: >-
+          [heartbeat OK] host={{ inventory_hostname }}
+          free_gb={{ (free_disk_bytes | int) // (1024*1024*1024) }}
+          state_file_exists={{ _state_stat.stat.exists }}

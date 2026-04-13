@@ -1,0 +1,450 @@
+// ============================================================
+// master_realtime_sync
+//
+// 파일 배포 흐름 (새 네트워크 전제 반영):
+//   1. Master에서 178 Nexus 다운로드 (Master ↔ Nexus 통신 가능)
+//   2. Master에서 리전별 seed 1대씩 선정 (총 3대)
+//   3. Master → seed 3대에 SSH 전송
+//   4. 각 seed → 같은 지역 peer에 fan-out
+//   5. cross-region fan-out 금지
+//
+// 핵심 규칙:
+//   - OOB Agent가 Nexus에 직접 접근하지 않음
+//   - Source of Truth: 178 infra-automation-raw-hosted
+//   - Jenkins는 오케스트레이터 및 중간 전달 허브
+// ============================================================
+
+import jenkins.model.Jenkins
+
+properties([
+  buildDiscarder(logRotator(numToKeepStr: '50', daysToKeepStr: '14')),
+  disableConcurrentBuilds(),
+  parameters([
+    string(name: 'event_id',           defaultValue: '', trim: true),
+    string(name: 'operation_type',     defaultValue: '', trim: true),
+    string(name: 'repository_name',    defaultValue: '', trim: true),
+    string(name: 'asset_path',         defaultValue: '', trim: true),
+    string(name: 'download_url',       defaultValue: '', trim: true),
+    string(name: 'checksum_algorithm', defaultValue: 'sha256', trim: true),
+    string(name: 'checksum_value',     defaultValue: '', trim: true),
+    string(name: 'file_size_bytes',    defaultValue: '0', trim: true)
+  ])
+])
+
+def sync_cfg = null
+
+pipeline {
+  agent { label 'built-in' }
+
+  environment {
+    SYNC_CONFIG_PATH       = '/etc/oob-sync/sync_config.yml'
+    ANSIBLE_PLAYBOOK_DIR   = '/opt/oob-sync/ansible/playbooks'
+  }
+
+  stages {
+
+    stage('1. 공통 설정 로드') {
+      steps {
+        script {
+          sync_cfg = readYaml(file: env.SYNC_CONFIG_PATH)
+          echo "[공통 설정 로드 완료] location_codes=${sync_cfg.location_codes}"
+        }
+      }
+    }
+
+    stage('2. Master에서 Nexus 파일 다운로드') {
+      when { expression { params.operation_type == 'upload' } }
+      steps {
+        script {
+          // Master 로컬에 파일 다운로드 (Master ↔ Nexus 통신 가능)
+          def staging_dir = sync_cfg.master_staging_path ?: '/var/lib/oob-sync/staging'
+          def rel_path = "${params.repository_name}/${params.asset_path}"
+          env.MASTER_STAGED_FILE = "${staging_dir}/${rel_path}"
+
+          withCredentials([
+            usernamePassword(credentialsId: sync_cfg.nexus.credentials_id,
+                             usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')
+          ]) {
+            def rc = sh(returnStatus: true, script: """
+              mkdir -p "\$(dirname '${env.MASTER_STAGED_FILE}')"
+              rm -f '${env.MASTER_STAGED_FILE}'
+
+              for attempt in \$(seq 1 ${sync_cfg.retry.download_max_attempts}); do
+                echo "[Master 다운로드 시도 \$attempt/${sync_cfg.retry.download_max_attempts}]"
+                curl -fSL --max-time ${sync_cfg.nexus.api_timeout_seconds} \
+                  -u "\$NEXUS_USER:\$NEXUS_PASS" \
+                  -o '${env.MASTER_STAGED_FILE}' \
+                  '${params.download_url}' && break
+                echo "[다운로드 실패, ${sync_cfg.retry.download_backoff_seconds}초 후 재시도]"
+                sleep ${sync_cfg.retry.download_backoff_seconds}
+              done
+
+              test -f '${env.MASTER_STAGED_FILE}'
+            """)
+
+            if (rc != 0) {
+              error("""[Master Nexus 다운로드 실패]
+
+발생상황:
+Jenkins Master에서 178 Nexus(${params.download_url})로부터 파일을 다운로드하지 못했습니다.
+
+원인:
+Nexus 접속 불가, 인증 실패, 네트워크 단절, 디스크 부족 중 하나.
+
+문제:
+모든 리전의 동기화가 중단됩니다.
+
+조치방법:
+1. Jenkins Master에서 curl로 ${params.download_url}에 직접 접근해 원인을 식별합니다.
+2. Credentials(${sync_cfg.nexus.credentials_id})의 유효성을 확인합니다.
+3. 해결 후 이 Job을 재실행하거나 다음 주기 점검이 자동 복구합니다.""")
+            }
+
+            // checksum 검증 (Master에서)
+            if (params.checksum_value) {
+              def actual = sh(returnStdout: true, script: "${params.checksum_algorithm}sum '${env.MASTER_STAGED_FILE}' | awk '{print \$1}'").trim()
+              if (actual != params.checksum_value) {
+                sh "rm -f '${env.MASTER_STAGED_FILE}'"
+                error("""[Master checksum 검증 실패]
+
+발생상황:
+Master에서 다운로드한 파일의 ${params.checksum_algorithm} checksum이 기대값과 다릅니다.
+expected=${params.checksum_value}
+actual=${actual}
+
+원인:
+다운로드 중 데이터 오염 또는 Nexus 메타 불일치.
+
+문제:
+손상된 파일을 seed에 전송하지 않기 위해 중단합니다.
+
+조치방법:
+1. Nexus에서 해당 asset의 checksum을 확인합니다.
+2. 이 Job을 재실행합니다.""")
+              }
+              echo "[Master checksum 검증 성공] ${params.checksum_algorithm}=${actual}"
+            }
+            echo "[Master 다운로드 완료] ${env.MASTER_STAGED_FILE}"
+          }
+        }
+      }
+    }
+
+    stage('3. 리전별 동기화 실행') {
+      steps {
+        script {
+          def region_results = [:]
+          for (loc in sync_cfg.location_codes) {
+            region_results[loc] = syncOneRegion(loc, sync_cfg)
+          }
+          def failed = region_results.findAll { k, v -> !v.success }
+          if (failed) {
+            echo """[일부 리전 동기화 실패]
+
+발생상황:
+${failed.keySet()} 리전에서 실시간 동기화가 실패했습니다.
+
+원인:
+리전별 상세 로그를 참고합니다.
+
+문제:
+실패 리전의 OOB Agent들이 최신 파일을 받지 못했습니다.
+
+조치방법:
+1. 각 리전별 실패 로그를 확인합니다.
+2. 다음 부분 점검(30분 이내)이 자동으로 재시도합니다."""
+            currentBuild.result = 'UNSTABLE'
+          } else {
+            echo "[모든 리전 동기화 성공] event_id=${params.event_id}"
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      // Master 임시 파일 정리
+      sh "rm -f '${env.MASTER_STAGED_FILE ?: '/dev/null'}' 2>/dev/null || true"
+    }
+  }
+}
+
+// 한 리전에 대해 seed 선정 → Master→seed 전송 → seed→peer fan-out
+def syncOneRegion(String location_code, def sync_cfg) {
+  def selector = "${location_code} && ${sync_cfg.oob_selector_label}"
+  def candidate_oob_nodes = nodesByLabel(label: selector, offline: true)
+  def online_oob_nodes   = []
+  def offline_oob_nodes  = []
+  def excluded_oob_nodes = []
+
+  candidate_oob_nodes.each { name ->
+    if (sync_cfg.exclude_node_names?.contains(name)) {
+      excluded_oob_nodes << name; return
+    }
+    def c = Jenkins.get().getNode(name)?.toComputer()
+    if (c != null && c.isOnline()) {
+      online_oob_nodes << name
+    } else {
+      offline_oob_nodes << name
+    }
+  }
+
+  if (online_oob_nodes.isEmpty()) {
+    echo """[${location_code} 리전 동기화 실패]
+
+발생상황:
+${location_code} 리전에서 사용 가능한 seed OOB Agent를 찾지 못했습니다.
+후보: ${candidate_oob_nodes}, 제외: ${excluded_oob_nodes}, 오프라인: ${offline_oob_nodes}
+
+원인:
+해당 리전 OOB Agent가 모두 오프라인이거나 제외 대상입니다.
+
+문제:
+${location_code} 리전으로 파일을 전달할 수 없습니다.
+
+조치방법:
+1. Jenkins 노드 관리에서 ${location_code} 리전 OOB Agent 상태를 확인합니다.
+2. 에이전트 복구 후 다음 부분 점검이 자동 동기화합니다."""
+    return [success: false, reason: 'no-online-oob']
+  }
+
+  // seed 선정
+  def pick_result = pickSeed(online_oob_nodes, params.repository_name, params.asset_path, sync_cfg)
+  def selected_seed_node  = pick_result.node
+  def selection_reason    = pick_result.reason
+  def selected_peer_nodes = online_oob_nodes.findAll { it != selected_seed_node }
+
+  echo "[${location_code}] seed=${selected_seed_node} peers=${selected_peer_nodes} 사유='${selection_reason}'"
+
+  def ok = false
+  def ssh_user = sync_cfg.master_to_seed?.ssh_user ?: 'cloviradmin'
+  def ssh_opts = sync_cfg.master_to_seed?.ssh_options ?: '-o StrictHostKeyChecking=no -o ConnectTimeout=10'
+
+  if (params.operation_type == 'upload') {
+    // === UPLOAD: Master → seed 전송 → seed → peer fan-out ===
+    def rel_path = "${params.repository_name}/${params.asset_path}"
+    def seed_final_path = "${sync_cfg.sync_root_path}/${rel_path}"
+    def seed_incoming_path = "${sync_cfg.incoming_root_path}/${rel_path}.part"
+
+    // Agent 이름 → IP 해소
+    def seed_ip = resolveAgentIP(selected_seed_node, sync_cfg)
+    echo "[${location_code}] seed=${selected_seed_node} (${seed_ip})"
+
+    withCredentials([
+      sshUserPrivateKey(credentialsId: 'jenkins-ssh-key',
+                        keyFileVariable: 'OOB_SSH_KEY', usernameVariable: 'OOB_SSH_USER')
+    ]) {
+      // Master → seed: scp 전송
+      def scp_rc = sh(returnStatus: true, script: """
+        # seed에 디렉터리 준비
+        ssh ${ssh_opts} -i "\$OOB_SSH_KEY" ${ssh_user}@${seed_ip} \
+          "mkdir -p '\$(dirname '${seed_incoming_path}')' && mkdir -p '\$(dirname '${seed_final_path}')'"
+
+        # Master → seed 전송
+        scp ${ssh_opts} -i "\$OOB_SSH_KEY" \
+          '${env.MASTER_STAGED_FILE}' \
+          ${ssh_user}@${seed_ip}:'${seed_incoming_path}'
+
+        # seed에서 incoming → final 원자적 이동
+        ssh ${ssh_opts} -i "\$OOB_SSH_KEY" ${ssh_user}@${seed_ip} \
+          "mv -f '${seed_incoming_path}' '${seed_final_path}'"
+      """)
+
+      if (scp_rc != 0) {
+        echo "[${location_code}] Master → seed(${selected_seed_node}) 전송 실패"
+        return [success: false, reason: 'master-to-seed-failed']
+      }
+      echo "[${location_code}] Master → seed 전송 완료"
+
+      // seed → same-region peer fan-out (seed Agent에서 cloviradmin key로 rsync)
+      if (selected_peer_nodes) {
+        def peer_ips = []
+        for (def pn : selected_peer_nodes) {
+          def pip = resolveAgentIP(pn, sync_cfg)
+          peer_ips.add(pip)
+          echo "[${location_code}] peer: ${pn} (${pip})"
+        }
+
+        // seed Agent 위에서 rsync 실행
+        // Jenkins Agent는 jenkins 유저로 실행되므로 cloviradmin의 key를 명시 참조
+        // Jenkins Agent는 jenkins 유저로 실행 — jenkins의 SSH key로 peer에 접근
+        def jenkins_key = "/home/jenkins/.ssh/id_rsa"
+        node(selected_seed_node) {
+          for (def pip : peer_ips) {
+            def fanout_rc = sh(returnStatus: true, script: """
+              ssh -i ${jenkins_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                ${ssh_user}@${pip} "mkdir -p '\$(dirname '${seed_final_path}')'"
+              rsync -avz --partial --timeout=300 \
+                -e "ssh -i ${jenkins_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
+                '${seed_final_path}' \
+                '${ssh_user}@${pip}:${seed_final_path}'
+            """)
+            if (fanout_rc == 0) {
+              echo "[${location_code}] seed → peer(${pip}) fan-out 성공"
+            } else {
+              echo "[${location_code}] seed → peer(${pip}) fan-out 실패 (reconcile이 복구)"
+            }
+          }
+        }
+      }
+      ok = true
+    }
+
+  } else if (params.operation_type == 'delete') {
+    // === DELETE: 업로드와 동일한 패턴 (Master→seed SSH→seed→peer SSH) ===
+    def rel_path_del = "${params.repository_name}/${params.asset_path}"
+    def final_path_del = "${sync_cfg.sync_root_path}/${rel_path_del}"
+    def quarantine_path_del = "${sync_cfg.quarantine_root_path}/${rel_path_del}"
+
+    // 1. Master → seed: quarantine 명령 (SSH)
+    def seed_ip_del = resolveAgentIP(selected_seed_node, sync_cfg)
+    withCredentials([
+      sshUserPrivateKey(credentialsId: 'jenkins-ssh-key',
+                        keyFileVariable: 'OOB_SSH_KEY', usernameVariable: 'OOB_SSH_USER')
+    ]) {
+      def seed_del_rc = sh(returnStatus: true, script: """
+        ssh ${ssh_opts} -i "\$OOB_SSH_KEY" ${ssh_user}@${seed_ip_del} \
+          "mkdir -p '\$(dirname '${quarantine_path_del}')' && \
+           if [ -f '${final_path_del}' ]; then \
+             mv -f '${final_path_del}' '${quarantine_path_del}'; \
+             echo 'QUARANTINED'; \
+           else \
+             echo 'NOT_FOUND'; \
+           fi"
+      """)
+      if (seed_del_rc == 0) {
+        echo "[${location_code}] seed(${seed_ip_del}) quarantine 완료"
+      } else {
+        echo "[${location_code}] seed quarantine 실패"
+      }
+    }
+
+    // 2. seed → same-region peer: quarantine 전파
+    if (selected_peer_nodes) {
+      def peer_ips_del = []
+      for (def pn : selected_peer_nodes) {
+        peer_ips_del.add(resolveAgentIP(pn, sync_cfg))
+      }
+      def jenkins_key_del = "/home/jenkins/.ssh/id_rsa"
+      node(selected_seed_node) {
+        for (def pip : peer_ips_del) {
+          def peer_del_rc = sh(returnStatus: true, script: """
+            ssh -i ${jenkins_key_del} -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              ${ssh_user}@${pip} \
+              "mkdir -p '\$(dirname '${quarantine_path_del}')' && \
+               if [ -f '${final_path_del}' ]; then \
+                 mv -f '${final_path_del}' '${quarantine_path_del}'; \
+                 echo 'QUARANTINED'; \
+               else \
+                 echo 'NOT_FOUND'; \
+               fi"
+          """)
+          if (peer_del_rc == 0) {
+            echo "[${location_code}] seed → peer(${pip}) quarantine 성공"
+          } else {
+            echo "[${location_code}] seed → peer(${pip}) quarantine 실패"
+          }
+        }
+      }
+    }
+    ok = true
+  }
+
+  if (!ok) {
+    echo """[${location_code} 리전 동기화 실패]
+
+발생상황:
+${location_code} 리전에서 ${params.operation_type} 처리가 실패했습니다.
+
+조치방법:
+콘솔 로그를 확인하고, 다음 부분 점검이 자동 재시도합니다."""
+    return [success: false, reason: 'sync-failed']
+  }
+  return [success: true]
+}
+
+// Agent 이름 → IP 해소 (agent_ip_map 우선)
+def resolveAgentIP(String nodeName, def sync_cfg) {
+  // 1순위: sync_config.yml의 agent_ip_map
+  def ip_map = sync_cfg.agent_ip_map ?: [:]
+  if (ip_map.containsKey(nodeName)) {
+    def ip = ip_map[nodeName]
+    echo "[IP 해소] ${nodeName} → ${ip} (agent_ip_map)"
+    return ip
+  }
+
+  // 2순위: Jenkins Node description 내 ip=... 태그
+  def nodeObj = Jenkins.get().getNode(nodeName)
+  if (nodeObj) {
+    def desc = nodeObj.getNodeDescription() ?: ''
+    def matcher = (desc =~ /ip=([0-9.]+)/)
+    if (matcher.find()) {
+      def ip = matcher.group(1)
+      echo "[IP 해소] ${nodeName} → ${ip} (node description)"
+      return ip
+    }
+
+    // 3순위: SSH Launcher host
+    def launcher = nodeObj.getLauncher()
+    try {
+      if (launcher.hasProperty('host') && launcher.host) {
+        echo "[IP 해소] ${nodeName} → ${launcher.host} (SSH launcher)"
+        return launcher.host
+      }
+    } catch (e) { /* not SSH launcher */ }
+  }
+
+  // 4순위: 실패 — 즉시 한글 오류
+  error("""[Agent IP 해소 실패]
+
+발생상황:
+'${nodeName}' 의 IP 주소를 찾을 수 없습니다.
+
+원인:
+sync_config.yml 의 agent_ip_map 에 '${nodeName}' 항목이 없고,
+Node description 에 ip= 태그도 없으며, SSH Launcher 도 설정되지 않았습니다.
+
+조치방법:
+1. /etc/oob-sync/sync_config.yml 의 agent_ip_map 에 '${nodeName}' 과 IP 를 추가합니다.
+2. 또는 Jenkins 노드 관리에서 '${nodeName}' 의 Description 에 ip=10.x.x.x 를 추가합니다.""")
+}
+
+// seed 선정: ①파일보유 → ②최근성공 → ③이름정렬 tie-break
+def pickSeed(List<String> online_oob_nodes, String repository_name, String asset_path, def sync_cfg) {
+  def target_path = "${sync_cfg.sync_root_path}/${repository_name}/${asset_path}"
+
+  // 1순위: 이미 해당 파일을 가진 노드
+  def nodes_with_file = []
+  online_oob_nodes.each { name ->
+    try {
+      node(name) {
+        def exists = sh(returnStatus: true, script: "test -f '${target_path}'")
+        if (exists == 0) nodes_with_file << name
+      }
+    } catch (e) { /* skip */ }
+  }
+  if (nodes_with_file.size() > 0) {
+    def chosen = nodes_with_file.sort().first()
+    return [node: chosen, reason: "파일 보유 노드(${chosen})를 seed로 선정"]
+  }
+
+  // 2순위: 최근 동기화 성공 이력
+  def nodes_with_state = []
+  online_oob_nodes.each { name ->
+    try {
+      node(name) {
+        def exists = sh(returnStatus: true, script: "test -f /var/lib/oob-sync/last_sync_state.json")
+        if (exists == 0) nodes_with_state << name
+      }
+    } catch (e) { /* skip */ }
+  }
+  if (nodes_with_state.size() > 0) {
+    def chosen = nodes_with_state.sort().first()
+    return [node: chosen, reason: "최근 성공 이력 노드(${chosen})를 seed로 선정"]
+  }
+
+  // 3순위: 이름 정렬 tie-break
+  def chosen = online_oob_nodes.sort().first()
+  return [node: chosen, reason: "tie-break(이름 순)로 '${chosen}'을 seed로 선정"]
+}

@@ -1,0 +1,49 @@
+# ============================================================
+# verify_file_integrity.yml
+# 파일 checksum 검증.
+# 호출측은 verify_target_path 변수로 검증 대상 경로를 전달한다.
+# ============================================================
+- name: 파일 존재 확인
+  stat:
+    path: "{{ verify_target_path }}"
+    checksum_algorithm: "{{ checksum_algorithm | default('sha256') }}"
+    get_checksum: true
+  register: _verify_stat
+
+- name: 파일 미존재 실패
+  when: not _verify_stat.stat.exists
+  fail:
+    msg: |
+      [checksum 검증 실패 - 파일 없음]
+      발생상황: 검증 대상 파일이 존재하지 않습니다 ({{ verify_target_path }}).
+      원인: 다운로드/전파 단계에서 파일이 생성되지 않았거나 삭제됨.
+      문제: 무결성 검증을 수행할 수 없습니다.
+      조치방법: 다운로드 또는 fan-out 단계의 실패 로그를 먼저 확인합니다.
+
+- name: 파일 크기 일치 확인 (file_size_bytes > 0 일 때만)
+  when: (file_size_bytes | int) > 0 and _verify_stat.stat.size != (file_size_bytes | int)
+  fail:
+    msg: |
+      [파일 크기 불일치]
+      발생상황: 파일 크기가 기대값과 다릅니다. expected={{ file_size_bytes }} actual={{ _verify_stat.stat.size }}
+      원인: 전송 중단, 디스크 부족, 네트워크 불안정.
+      문제: 손상된 파일이 최종 경로로 반영될 위험이 있어 즉시 중단합니다.
+      조치방법: 임시 파일을 폐기하고 다운로드를 재시도합니다.
+
+- name: checksum 일치 확인 (checksum_value 가 주어진 경우만)
+  when: checksum_value | length > 0 and _verify_stat.stat.checksum != checksum_value
+  fail:
+    msg: |
+      [checksum 불일치]
+      발생상황: {{ checksum_algorithm }} checksum 이 기대값과 다릅니다.
+      expected={{ checksum_value }}
+      actual  ={{ _verify_stat.stat.checksum }}
+      원인: 다운로드 중 데이터 오염 또는 Nexus 메타 불일치.
+      문제: 손상된 파일이 최종 경로로 반영될 위험이 있어 즉시 중단합니다.
+      조치방법: 임시 파일을 폐기하고 다운로드 또는 전파를 재시도합니다.
+
+- name: 검증 성공 로그
+  debug:
+    msg: >-
+      [checksum 검증 성공] path={{ verify_target_path }}
+      algorithm={{ checksum_algorithm }} checksum={{ _verify_stat.stat.checksum }}
