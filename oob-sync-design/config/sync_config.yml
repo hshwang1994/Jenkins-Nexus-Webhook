@@ -78,10 +78,14 @@ build_retention:
   full:      { num_to_keep: 14, days_to_keep: 30 }
   heartbeat: { num_to_keep: 30, days_to_keep: 7 }
 
-# 대용량 파일 전송 한도
+# 대용량 파일 전송 한도 (50GB 목표 기준)
+# 산정 근거:
+#   50GB 파일 1개 + 임시파일(incoming) + 검증 중 중복 점유 = 최대 150GB 필요
+#   staging(Master): 50GB 파일 + 50GB 여유 = 100GB 최소
+#   sync_root(Agent): 50GB 파일 + incoming 50GB + quarantine + 여유 = 200GB 권장
 limits:
-  max_file_size_bytes: 21474836480   # 20 GB
-  min_free_disk_bytes:  53687091200  # 50 GB 여유 확보 기준
+  max_file_size_bytes: 53687091200   # 50 GB
+  min_free_disk_bytes: 107374182400  # 100 GB 여유 확보 기준 (50GB 파일 + 50GB 여유)
 
 # Ansible playbook 배포 경로
 ansible_playbook_dir: /opt/oob-sync/ansible/playbooks
@@ -92,8 +96,6 @@ fanout:
   rsync_options: "-avz --partial --inplace --whole-file --timeout=300"
   ssh_user: cloviradmin
   ssh_key_credentials_id: oob-sync-ssh-key
-  # 운영 전: StrictHostKeyChecking=no → known_hosts 사전 등록 후 제거
-  # 06_운영하드닝.md 참조
   ssh_options: "-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
 # Master → Seed 전송 수단 (Jenkins Master → regional seed)

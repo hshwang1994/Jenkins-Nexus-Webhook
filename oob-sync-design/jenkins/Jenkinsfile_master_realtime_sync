@@ -36,6 +36,10 @@ def sync_cfg = null
 pipeline {
   agent { label 'built-in' }
 
+  options {
+    timeout(time: 4, unit: 'HOURS')  // 50GB 전송 기준 최대 4시간
+  }
+
   environment {
     SYNC_CONFIG_PATH       = '/etc/oob-sync/sync_config.yml'
     ANSIBLE_PLAYBOOK_DIR   = '/opt/oob-sync/ansible/playbooks'
@@ -71,7 +75,7 @@ pipeline {
 
               for attempt in \$(seq 1 ${sync_cfg.retry.download_max_attempts}); do
                 echo "[Master 다운로드 시도 \$attempt/${sync_cfg.retry.download_max_attempts}]"
-                curl -fSL --max-time ${sync_cfg.nexus.api_timeout_seconds} \
+                curl -fSL --connect-timeout 30 --max-time 7200 \
                   -u "\$NEXUS_USER:\$NEXUS_PASS" \
                   -o '${env.MASTER_STAGED_FILE}' \
                   '${params.download_url}' && break
@@ -235,16 +239,17 @@ ${location_code} 리전으로 파일을 전달할 수 없습니다.
       sshUserPrivateKey(credentialsId: 'jenkins-ssh-key',
                         keyFileVariable: 'OOB_SSH_KEY', usernameVariable: 'OOB_SSH_USER')
     ]) {
-      // Master → seed: scp 전송
+      // Master → seed: rsync 전송 (대용량 친화, 부분전송 재개 가능)
       def scp_rc = sh(returnStatus: true, script: """
         # seed에 디렉터리 준비
         ssh ${ssh_opts} -i "\$OOB_SSH_KEY" ${ssh_user}@${seed_ip} \
           "mkdir -p '\$(dirname '${seed_incoming_path}')' && mkdir -p '\$(dirname '${seed_final_path}')'"
 
-        # Master → seed 전송
-        scp ${ssh_opts} -i "\$OOB_SSH_KEY" \
+        # Master → seed rsync 전송 (--partial: 중단 시 재개, --timeout: I/O 타임아웃)
+        rsync --partial --inplace --whole-file --timeout=3600 --progress \
+          -e "ssh ${ssh_opts} -i \$OOB_SSH_KEY" \
           '${env.MASTER_STAGED_FILE}' \
-          ${ssh_user}@${seed_ip}:'${seed_incoming_path}'
+          '${ssh_user}@${seed_ip}:${seed_incoming_path}'
 
         # seed에서 incoming → final 원자적 이동
         ssh ${ssh_opts} -i "\$OOB_SSH_KEY" ${ssh_user}@${seed_ip} \
@@ -275,7 +280,7 @@ ${location_code} 리전으로 파일을 전달할 수 없습니다.
             def fanout_rc = sh(returnStatus: true, script: """
               ssh -i ${jenkins_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
                 ${ssh_user}@${pip} "mkdir -p '\$(dirname '${seed_final_path}')'"
-              rsync -avz --partial --timeout=300 \
+              rsync --partial --inplace --whole-file --timeout=3600 \
                 -e "ssh -i ${jenkins_key} -o StrictHostKeyChecking=no -o ConnectTimeout=10" \
                 '${seed_final_path}' \
                 '${ssh_user}@${pip}:${seed_final_path}'
